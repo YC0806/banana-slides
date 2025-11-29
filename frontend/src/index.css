@@ -1,0 +1,65 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* 主色 - 黄色系 */
+  --banana-yellow: #FFD700;
+  --banana-yellow-light: #FFE44D;
+  --banana-yellow-dark: #FFC700;
+  --banana-yellow-pale: #FFF9E6;
+
+  /* 中性色 - 黑白灰 */
+  --black: #1A1A1A;
+  --black-80: #4A4A4A;
+  --black-60: #757575;
+  --black-10: #F5F5F5;
+  --white: #FFFFFF;
+
+  /* 功能色 */
+  --success: #52C41A;
+  --warning: #FAAD14;
+  --error: #FF4D4F;
+  --info: #1890FF;
+
+  /* 过渡 */
+  --transition-fast: 150ms ease-in-out;
+  --transition-base: 250ms ease-in-out;
+  --transition-slow: 350ms ease-in-out;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* 自定义滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--black-10);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--banana-yellow);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--banana-yellow-dark);
+}
+

@@ -1,0 +1,192 @@
+"""
+File Service - handles all file operations
+"""
+import os
+import uuid
+from pathlib import Path
+from typing import Optional
+from werkzeug.utils import secure_filename
+from PIL import Image
+
+
+class FileService:
+    """Service for file management"""
+    
+    def __init__(self, upload_folder: str):
+        """Initialize file service"""
+        self.upload_folder = Path(upload_folder)
+        self.upload_folder.mkdir(exist_ok=True, parents=True)
+    
+    def _get_project_dir(self, project_id: str) -> Path:
+        """Get project directory"""
+        project_dir = self.upload_folder / project_id
+        project_dir.mkdir(exist_ok=True, parents=True)
+        return project_dir
+    
+    def _get_template_dir(self, project_id: str) -> Path:
+        """Get template directory for project"""
+        template_dir = self._get_project_dir(project_id) / "template"
+        template_dir.mkdir(exist_ok=True, parents=True)
+        return template_dir
+    
+    def _get_pages_dir(self, project_id: str) -> Path:
+        """Get pages directory for project"""
+        pages_dir = self._get_project_dir(project_id) / "pages"
+        pages_dir.mkdir(exist_ok=True, parents=True)
+        return pages_dir
+    
+    def save_template_image(self, file, project_id: str) -> str:
+        """
+        Save template image file
+        
+        Args:
+            file: FileStorage object from Flask request
+            project_id: Project ID
+        
+        Returns:
+            Relative file path from upload folder
+        """
+        template_dir = self._get_template_dir(project_id)
+        
+        # Secure filename and add unique suffix
+        original_filename = secure_filename(file.filename)
+        ext = original_filename.rsplit('.', 1)[1].lower() if '.' in original_filename else 'png'
+        filename = f"template.{ext}"
+        
+        filepath = template_dir / filename
+        file.save(str(filepath))
+        
+        # Return relative path
+        return str(filepath.relative_to(self.upload_folder))
+    
+    def save_generated_image(self, image: Image.Image, project_id: str, 
+                           page_id: str, format: str = 'PNG') -> str:
+        """
+        Save generated image
+        
+        Args:
+            image: PIL Image object
+            project_id: Project ID
+            page_id: Page ID
+            format: Image format
+        
+        Returns:
+            Relative file path from upload folder
+        """
+        pages_dir = self._get_pages_dir(project_id)
+        
+        filename = f"{page_id}.{format.lower()}"
+        filepath = pages_dir / filename
+        
+        image.save(str(filepath), format=format)
+        
+        # Return relative path
+        return str(filepath.relative_to(self.upload_folder))
+    
+    def get_file_url(self, project_id: str, file_type: str, filename: str) -> str:
+        """
+        Generate file URL for frontend access
+        
+        Args:
+            project_id: Project ID
+            file_type: 'template' or 'pages'
+            filename: File name
+        
+        Returns:
+            URL path for file access
+        """
+        return f"/files/{project_id}/{file_type}/{filename}"
+    
+    def get_absolute_path(self, relative_path: str) -> str:
+        """
+        Get absolute file path from relative path
+        
+        Args:
+            relative_path: Relative path from upload folder
+        
+        Returns:
+            Absolute file path
+        """
+        return str(self.upload_folder / relative_path)
+    
+    def delete_template(self, project_id: str) -> bool:
+        """
+        Delete template for project
+        
+        Args:
+            project_id: Project ID
+        
+        Returns:
+            True if deleted successfully
+        """
+        template_dir = self._get_template_dir(project_id)
+        
+        # Delete all files in template directory
+        for file in template_dir.iterdir():
+            if file.is_file():
+                file.unlink()
+        
+        return True
+    
+    def delete_page_image(self, project_id: str, page_id: str) -> bool:
+        """
+        Delete page image
+        
+        Args:
+            project_id: Project ID
+            page_id: Page ID
+        
+        Returns:
+            True if deleted successfully
+        """
+        pages_dir = self._get_pages_dir(project_id)
+        
+        # Find and delete page image (any extension)
+        for file in pages_dir.glob(f"{page_id}.*"):
+            if file.is_file():
+                file.unlink()
+        
+        return True
+    
+    def delete_project_files(self, project_id: str) -> bool:
+        """
+        Delete all files for a project
+        
+        Args:
+            project_id: Project ID
+        
+        Returns:
+            True if deleted successfully
+        """
+        import shutil
+        project_dir = self._get_project_dir(project_id)
+        
+        if project_dir.exists():
+            shutil.rmtree(project_dir)
+        
+        return True
+    
+    def file_exists(self, relative_path: str) -> bool:
+        """Check if file exists"""
+        filepath = self.upload_folder / relative_path
+        return filepath.exists() and filepath.is_file()
+    
+    def get_template_path(self, project_id: str) -> Optional[str]:
+        """
+        Get template file path for project
+        
+        Args:
+            project_id: Project ID
+        
+        Returns:
+            Absolute path to template file or None
+        """
+        template_dir = self._get_template_dir(project_id)
+        
+        # Find template file
+        for file in template_dir.iterdir():
+            if file.is_file() and file.stem == 'template':
+                return str(file)
+        
+        return None
+

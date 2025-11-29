@@ -1,0 +1,340 @@
+"""
+Task Manager - handles background tasks using ThreadPoolExecutor
+No need for Celery or Redis, uses in-memory task tracking
+"""
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, List, Dict, Any
+from datetime import datetime
+from models import db, Task, Page
+
+
+class TaskManager:
+    """Simple task manager using ThreadPoolExecutor"""
+    
+    def __init__(self, max_workers: int = 4):
+        """Initialize task manager"""
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.active_tasks = {}  # task_id -> Future
+        self.lock = threading.Lock()
+    
+    def submit_task(self, task_id: str, func: Callable, *args, **kwargs):
+        """Submit a background task"""
+        future = self.executor.submit(func, task_id, *args, **kwargs)
+        
+        with self.lock:
+            self.active_tasks[task_id] = future
+        
+        # Add callback to clean up when done
+        future.add_done_callback(lambda f: self._cleanup_task(task_id))
+    
+    def _cleanup_task(self, task_id: str):
+        """Clean up completed task"""
+        with self.lock:
+            if task_id in self.active_tasks:
+                del self.active_tasks[task_id]
+    
+    def is_task_active(self, task_id: str) -> bool:
+        """Check if task is still running"""
+        with self.lock:
+            return task_id in self.active_tasks
+    
+    def shutdown(self):
+        """Shutdown the executor"""
+        self.executor.shutdown(wait=True)
+
+
+# Global task manager instance
+task_manager = TaskManager(max_workers=4)
+
+
+def generate_descriptions_task(task_id: str, project_id: str, ai_service, 
+                               idea_prompt: str, outline: List[Dict], 
+                               max_workers: int = 5, app=None):
+    """
+    Background task for generating page descriptions
+    Based on demo.py gen_desc() with parallel processing
+    
+    Note: app instance MUST be passed from the request context
+    """
+    if app is None:
+        raise ValueError("Flask app instance must be provided")
+    
+    # 在整个任务中保持应用上下文
+    with app.app_context():
+        try:
+            # 重要：在后台线程开始时就获取task和设置状态
+            task = Task.query.get(task_id)
+            if not task:
+                print(f"[ERROR] Task {task_id} not found")
+                return
+            
+            task.status = 'PROCESSING'
+            db.session.commit()
+            print(f"[INFO] Task {task_id} status updated to PROCESSING")
+            
+            # Flatten outline to get pages
+            pages_data = ai_service.flatten_outline(outline)
+            
+            # Get all pages for this project
+            pages = Page.query.filter_by(project_id=project_id).order_by(Page.order_index).all()
+            
+            if len(pages) != len(pages_data):
+                raise ValueError("Page count mismatch")
+            
+            # Initialize progress
+            task.set_progress({
+                "total": len(pages),
+                "completed": 0,
+                "failed": 0
+            })
+            db.session.commit()
+            
+            # Generate descriptions in parallel
+            completed = 0
+            failed = 0
+            
+            def generate_single_desc(page_id, page_outline, page_index):
+                """
+                Generate description for a single page
+                注意：只传递 page_id（字符串），不传递 ORM 对象，避免跨线程会话问题
+                """
+                # 关键修复：在子线程中也需要应用上下文
+                with app.app_context():
+                    try:
+                        desc_text = ai_service.generate_page_description(
+                            idea_prompt, outline, page_outline, page_index
+                        )
+                        
+                        # Parse description into structured format
+                        # This is a simplified version - you may want more sophisticated parsing
+                        desc_content = {
+                            "text": desc_text,
+                            "generated_at": datetime.utcnow().isoformat()
+                        }
+                        
+                        return (page_id, desc_content, None)
+                    except Exception as e:
+                        import traceback
+                        error_detail = traceback.format_exc()
+                        print(f"[ERROR] Failed to generate description for page {page_id}: {error_detail}")
+                        return (page_id, None, str(e))
+            
+            # Use ThreadPoolExecutor for parallel generation
+            # 关键：提前提取 page.id，不要传递 ORM 对象到子线程
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(generate_single_desc, page.id, page_data, i)
+                    for i, (page, page_data) in enumerate(zip(pages, pages_data), 1)
+                ]
+                
+                # Process results as they complete
+                for future in as_completed(futures):
+                    page_id, desc_content, error = future.result()
+                    
+                    # Update page in database
+                    page = Page.query.get(page_id)
+                    if page:
+                        if error:
+                            page.status = 'FAILED'
+                            failed += 1
+                        else:
+                            page.set_description_content(desc_content)
+                            page.status = 'DESCRIPTION_GENERATED'
+                            completed += 1
+                        
+                        db.session.commit()
+                    
+                    # Update task progress
+                    task = Task.query.get(task_id)
+                    if task:
+                        task.update_progress(completed=completed, failed=failed)
+                        db.session.commit()
+                        print(f"[INFO] Description Progress: {completed}/{len(pages)} pages completed")
+            
+            # Mark task as completed
+            task = Task.query.get(task_id)
+            if task:
+                task.status = 'COMPLETED'
+                task.completed_at = datetime.utcnow()
+                db.session.commit()
+                print(f"[INFO] Task {task_id} COMPLETED - {completed} pages generated, {failed} failed")
+            
+            # Update project status
+            from models import Project
+            project = Project.query.get(project_id)
+            if project and failed == 0:
+                project.status = 'DESCRIPTIONS_GENERATED'
+                db.session.commit()
+                print(f"[INFO] Project {project_id} status updated to DESCRIPTIONS_GENERATED")
+        
+        except Exception as e:
+            # Mark task as failed
+            task = Task.query.get(task_id)
+            if task:
+                task.status = 'FAILED'
+                task.error_message = str(e)
+                task.completed_at = datetime.utcnow()
+                db.session.commit()
+
+
+def generate_images_task(task_id: str, project_id: str, ai_service, file_service,
+                        outline: List[Dict], use_template: bool = True, 
+                        max_workers: int = 8, aspect_ratio: str = "16:9",
+                        resolution: str = "2K", app=None):
+    """
+    Background task for generating page images
+    Based on demo.py gen_images_parallel()
+    
+    Note: app instance MUST be passed from the request context
+    """
+    if app is None:
+        raise ValueError("Flask app instance must be provided")
+    
+    with app.app_context():
+        try:
+            # Update task status to PROCESSING
+            task = Task.query.get(task_id)
+            if not task:
+                return
+            
+            task.status = 'PROCESSING'
+            db.session.commit()
+            
+            # Get all pages for this project
+            pages = Page.query.filter_by(project_id=project_id).order_by(Page.order_index).all()
+            pages_data = ai_service.flatten_outline(outline)
+            
+            # Get template path if use_template
+            ref_image_path = None
+            if use_template:
+                ref_image_path = file_service.get_template_path(project_id)
+            
+            if not ref_image_path:
+                raise ValueError("No template image found for project")
+            
+            # Initialize progress
+            task.set_progress({
+                "total": len(pages),
+                "completed": 0,
+                "failed": 0
+            })
+            db.session.commit()
+            
+            # Generate images in parallel
+            completed = 0
+            failed = 0
+            
+            def generate_single_image(page_id, page_data, page_index):
+                """
+                Generate image for a single page
+                注意：只传递 page_id（字符串），不传递 ORM 对象，避免跨线程会话问题
+                """
+                # 关键修复：在子线程中也需要应用上下文
+                with app.app_context():
+                    try:
+                        print(f"[DEBUG] Starting image generation for page {page_id}, index {page_index}")
+                        # Get page from database in this thread
+                        page_obj = Page.query.get(page_id)
+                        if not page_obj:
+                            raise ValueError(f"Page {page_id} not found")
+                        
+                        # Update page status
+                        page_obj.status = 'GENERATING'
+                        db.session.commit()
+                        print(f"[DEBUG] Page {page_id} status updated to GENERATING")
+                        
+                        # Get description content
+                        desc_content = page_obj.get_description_content()
+                        if not desc_content:
+                            raise ValueError("No description content for page")
+                        
+                        desc_text = desc_content.get('text', '')
+                        print(f"[DEBUG] Got description text for page {page_id}: {desc_text[:100]}...")
+                        
+                        # Generate image prompt
+                        prompt = ai_service.generate_image_prompt(
+                            outline, page_data, desc_text, page_index
+                        )
+                        print(f"[DEBUG] Generated image prompt for page {page_id}")
+                        
+                        # Generate image
+                        print(f"[INFO] 🎨 Calling AI service to generate image for page {page_index}/{len(pages)}...")
+                        image = ai_service.generate_image(
+                            prompt, ref_image_path, aspect_ratio, resolution
+                        )
+                        print(f"[INFO] ✅ Image generated successfully for page {page_index}")
+                        
+                        if not image:
+                            raise ValueError("Failed to generate image")
+                        
+                        # Save image
+                        image_path = file_service.save_generated_image(
+                            image, project_id, page_id
+                        )
+                        
+                        return (page_id, image_path, None)
+                        
+                    except Exception as e:
+                        import traceback
+                        error_detail = traceback.format_exc()
+                        print(f"[ERROR] Failed to generate image for page {page_id}: {error_detail}")
+                        return (page_id, None, str(e))
+            
+            # Use ThreadPoolExecutor for parallel generation
+            # 关键：提前提取 page.id，不要传递 ORM 对象到子线程
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(generate_single_image, page.id, page_data, i)
+                    for i, (page, page_data) in enumerate(zip(pages, pages_data), 1)
+                ]
+                
+                # Process results as they complete
+                for future in as_completed(futures):
+                    page_id, image_path, error = future.result()
+                    
+                    # Update page in database
+                    page = Page.query.get(page_id)
+                    if page:
+                        if error:
+                            page.status = 'FAILED'
+                            failed += 1
+                        else:
+                            page.generated_image_path = image_path
+                            page.status = 'COMPLETED'
+                            completed += 1
+                        
+                        db.session.commit()
+                    
+                    # Update task progress
+                    task = Task.query.get(task_id)
+                    if task:
+                        task.update_progress(completed=completed, failed=failed)
+                        db.session.commit()
+                        print(f"[INFO] Image Progress: {completed}/{len(pages)} pages completed")
+            
+            # Mark task as completed
+            task = Task.query.get(task_id)
+            if task:
+                task.status = 'COMPLETED'
+                task.completed_at = datetime.utcnow()
+                db.session.commit()
+                print(f"[INFO] Task {task_id} COMPLETED - {completed} images generated, {failed} failed")
+            
+            # Update project status
+            from models import Project
+            project = Project.query.get(project_id)
+            if project and failed == 0:
+                project.status = 'COMPLETED'
+                db.session.commit()
+                print(f"[INFO] Project {project_id} status updated to COMPLETED")
+        
+        except Exception as e:
+            # Mark task as failed
+            task = Task.query.get(task_id)
+            if task:
+                task.status = 'FAILED'
+                task.error_message = str(e)
+                task.completed_at = datetime.utcnow()
+                db.session.commit()
+

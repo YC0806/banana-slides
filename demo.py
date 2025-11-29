@@ -303,6 +303,6 @@ def gen_ppt(idea_prompt, ref_image):
     
 
 if __name__ == "__main__":
-    idea_prompt="生成一张关于人类活动对生态环境影响的ppt."
+    idea_prompt="生成一张关于人类活动对生态环境影响的ppt.只要3页。"
     ref_image="template_g.png"
     gen_ppt(idea_prompt, ref_image)

@@ -26,18 +26,20 @@ def gen_image(prompt: str, ref_image_path: str, aspect_ratio: str = DEFAULT_ASPE
         ],
         config=types.GenerateContentConfig(
             response_modalities=['TEXT', 'IMAGE'],
-            image_config=types.ImageConfig(
-                aspect_ratio=aspect_ratio,
-                image_size=resolution
-            ),
         )
     )
 
     for part in response.parts:
         if part.text is not None:   
             print(part.text)
-        elif image := part.as_image():
-            return image
+        else:
+            # Try to get image from part
+            try:
+                image = part.as_image()
+                if image:
+                    return image
+            except:
+                pass
     
     return None
 
