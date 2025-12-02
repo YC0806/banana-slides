@@ -11,6 +11,13 @@ from textwrap import dedent
 from google import genai
 from google.genai import types
 from PIL import Image
+from .prompts import (
+    get_outline_generation_prompt,
+    get_outline_parsing_prompt,
+    get_page_description_prompt,
+    get_image_generation_prompt,
+    get_image_edit_prompt
+)
 
 
 class AIService:
@@ -85,37 +92,7 @@ class AIService:
         Returns:
             List of outline items (may contain parts with pages or direct pages)
         """
-        outline_prompt = dedent(f"""\
-        You are a helpful assistant that generates an outline for a ppt.
-        
-        You can organize the content in two ways:
-        
-        1. Simple format (for short PPTs without major sections):
-        [{{"title": "title1", "points": ["point1", "point2"]}}, {{"title": "title2", "points": ["point1", "point2"]}}]
-        
-        2. Part-based format (for longer PPTs with major sections):
-        [
-          {{
-            "part": "Part 1: Introduction",
-            "pages": [
-              {{"title": "Welcome", "points": ["point1", "point2"]}},
-              {{"title": "Overview", "points": ["point1", "point2"]}}
-            ]
-          }},
-          {{
-            "part": "Part 2: Main Content",
-            "pages": [
-              {{"title": "Topic 1", "points": ["point1", "relavant_pic_url1", "point2"]}},
-              {{"title": "Topic 2", "points": ["point1", "point2", "relavant_pic_url2"]}}
-            ]
-          }}
-        ]
-        
-        Choose the format that best fits the content. Use parts when the PPT has clear major sections.
-        
-        The user's request: {idea_prompt}. Now generate the outline, don't include any other text.
-        使用全中文输出。
-        """)
+        outline_prompt = get_outline_generation_prompt(idea_prompt)
         
         response = self.client.models.generate_content(
             model=self.text_model,
@@ -127,6 +104,31 @@ class AIService:
         
         outline_text = response.text.strip().strip("```json").strip("```").strip()
         outline = json.loads(outline_text)
+        return outline
+    
+    def parse_outline_text(self, outline_text: str) -> List[Dict]:
+        """
+        Parse user-provided outline text into structured outline format
+        This method analyzes the text and splits it into pages without modifying the original text
+        
+        Args:
+            outline_text: User-provided outline text (may contain sections, titles, bullet points, etc.)
+        
+        Returns:
+            List of outline items (may contain parts with pages or direct pages)
+        """
+        parse_prompt = get_outline_parsing_prompt(outline_text)
+        
+        response = self.client.models.generate_content(
+            model=self.text_model,
+            contents=parse_prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=1000),
+            ),
+        )
+        
+        outline_json = response.text.strip().strip("```json").strip("```").strip()
+        outline = json.loads(outline_json)
         return outline
     
     def flatten_outline(self, outline: List[Dict]) -> List[Dict]:
@@ -164,24 +166,13 @@ class AIService:
         """
         part_info = f"\nThis page belongs to: {page_outline['part']}" if 'part' in page_outline else ""
         
-        desc_prompt = dedent(f"""\
-        we are generating the text desciption for each ppt page.
-        the original user request is: \n{idea_prompt}\n
-        We already have the entire ouline: \n{outline}\n{part_info}
-        Now please generate the description for page {page_index}:
-        {page_outline}
-        The description includes page title, text to render(keep it concise).
-        For example:
-        页面标题：原始社会：与自然共生
-        页面文字：
-        - 狩猎采集文明： 人类活动规模小，对环境影响有限。
-        - 依赖性强： 生活完全依赖于自然资源的直接供给，对自然规律敬畏。
-        - 适应而非改造： 通过观察和模仿学习自然，发展出适应当地环境的生存技能。
-        - 影响特点： 局部、短期、低强度，生态系统有充足的自我恢复能力。
-        其他页面素材（如果有请加上，包括markdown图片链接等）
-        
-        使用全中文输出。
-        """)
+        desc_prompt = get_page_description_prompt(
+            idea_prompt=idea_prompt,
+            outline=outline,
+            page_outline=page_outline,
+            page_index=page_index,
+            part_info=part_info
+        )
         
         response = self.client.models.generate_content(
             model=self.text_model,
@@ -235,31 +226,13 @@ class AIService:
         else:
             current_section = f"{page.get('title', 'Untitled')}"
         
-        # 如果有素材图片，在 prompt 中明确告知 AI
-        material_images_note = ""
-        if has_material_images:
-            material_images_note = (
-                "\n\n提示：除了模板参考图片（用于风格参考）外，还提供了额外的素材图片。"
-                "这些素材图片是可供挑选和使用的元素，你可以从这些素材图片中选择合适的图片、图标、图表或其他视觉元素"
-                "直接整合到生成的PPT页面中。请根据页面内容的需要，智能地选择和组合这些素材图片中的元素。"
-            )
-        
-        # 添加额外要求到提示词
-        extra_req_text = ""
-        if extra_requirements and extra_requirements.strip():
-            extra_req_text = f"\n\n额外要求（请务必遵循）：\n{extra_requirements}\n"
-        
-        prompt = dedent(f"""\
-        利用专业平面设计知识，根据参考图片的色彩与风格生成一页设计风格相同的ppt页面，作为整个ppt的其中一页，内容是:
-        {page_desc}（文字内容一致即可，表点符号、文字布局可以美化）
-        
-        整个ppt的大纲为：
-        {outline_text}
-        
-        当前位于章节：{current_section}
-        
-        要求文字清晰锐利，画面为4k分辨率 16:9比例.画面风格与配色保持严格一致。ppt使用全中文。{material_images_note}{extra_req_text}
-        """)
+        prompt = get_image_generation_prompt(
+            page_desc=page_desc,
+            outline_text=outline_text,
+            current_section=current_section,
+            has_material_images=has_material_images,
+            extra_requirements=extra_requirements
+        )
         
         return prompt
     
@@ -388,16 +361,9 @@ class AIService:
             PIL Image object or None if failed
         """
         # Build edit instruction with original description if available
-        if original_description:
-            edit_instruction = dedent(f"""\
-            该PPT页面的原始页面描述为：
-            {original_description}
-            
-            现在，根据以下指令修改这张PPT页面：{prompt}
-            
-            要求维持原有的文字内容和设计风格，只按照指令进行修改。
-            """)
-        else:
-            edit_instruction = f"根据以下指令修改这张PPT页面：{prompt}\n保持原有的内容结构和设计风格，只按照指令进行修改。"
+        edit_instruction = get_image_edit_prompt(
+            edit_instruction=prompt,
+            original_description=original_description
+        )
         return self.generate_image(edit_instruction, current_image_path, aspect_ratio, resolution, additional_ref_images)
 
